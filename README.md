@@ -31,4 +31,5 @@ node --test promptfoo-strict-eval/test_strict_eval.cjs
 ## 关联
 
 - 全部提案均已在对应仓库对外发布（账号 tanbopiao），进入对等回馈观察期。
+- 镜像：本仓库与魔挂数据集 [zongyuanroot/open-source-gap-fixes](https://www.modelscope.cn/datasets/zongyuanroot/open-source-gap-fixes) 内容一致，互为镜像。
 - 缺口发现方法：源码逐行核验 + 社区议题家族归因，详见各条目提案正文。
