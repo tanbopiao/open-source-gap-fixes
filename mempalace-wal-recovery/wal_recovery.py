@@ -41,10 +41,18 @@ INTENT = "intent"
 OUTCOME = "outcome"
 
 
-def idempotency_key(drawer_id: str, content: Any) -> str:
-    """Stable key so a partially-completed write is not duplicated."""
-    blob = json.dumps(content, sort_keys=True, ensure_ascii=False)
-    return f"{drawer_id}:{hashlib.sha256(blob.encode()).hexdigest()[:16]}"
+def idempotency_key(op: str, params: Any) -> str:
+    """Stable key so a partially-completed write is not duplicated.
+
+    Red-team fix (2026-11-26 exercise): the key now includes the op and the
+    full params. The legacy drawer_id+content key collided across ops —
+    e.g. DELETE and CLEAR on the same drawer with no content produced the
+    same key, so one real mutation was silently skipped as a duplicate.
+    NOTE: signature change from (drawer_id, content); callers must pass the
+    op through.
+    """
+    blob = json.dumps({"op": op, "params": params}, sort_keys=True, ensure_ascii=False)
+    return f"{op}:{hashlib.sha256(blob.encode()).hexdigest()[:16]}"
 
 
 class Wal:
@@ -54,6 +62,7 @@ class Wal:
         self.path = path
         self.fsync_intents = fsync_intents
         self._ordering_fallback_cursor = 0  # for entries without wal_id
+        self.corrupt_lines = 0  # red-team telemetry: skipped malformed lines
 
     # -- low-level append -------------------------------------------------------
 
@@ -94,8 +103,15 @@ class Wal:
         with open(self.path, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
-                if line:
+                if not line:
+                    continue
+                try:
                     out.append(json.loads(line))
+                except json.JSONDecodeError:
+                    # Red-team fix: a torn/corrupt tail line (partial write)
+                    # must not make the whole log unreadable. Skip it; the
+                    # intent it may have held stays pending by definition.
+                    self.corrupt_lines += 1
         return out
 
     def pending_intents(self) -> list[dict]:
@@ -141,9 +157,7 @@ class Wal:
         seen = seen_keys if seen_keys is not None else set()
         would_redo, redone, skipped = [], [], []
         for entry in self.pending_intents():
-            key = idempotency_key(
-                str(entry["params"].get("drawer_id", "")), entry["params"].get("content")
-            )
+            key = idempotency_key(entry["op"], entry["params"])
             if key in seen:
                 skipped.append(entry["wal_id"])
                 continue
@@ -151,5 +165,9 @@ class Wal:
             if not dry_run:
                 executor(entry["op"], entry["params"])
                 redone.append(entry["wal_id"])
+                # Red-team fix: self-settlement. Without an outcome the
+                # intent stays pending forever and every recovery re-executes
+                # it (double-apply). Replay now settles what it redid.
+                self.log_result(entry["wal_id"], {"status": "replayed"})
             seen.add(key)
         return {"would_redo": would_redo, "redone": redone, "skipped_idempotent": skipped}

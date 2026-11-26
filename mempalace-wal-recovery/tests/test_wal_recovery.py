@@ -64,7 +64,7 @@ class TestWalRecovery(unittest.TestCase):
         wal = Wal(self.path)
         params = {"drawer_id": "d1", "content": "hi"}
         wal.log_intent("add_memory", params)
-        key = idempotency_key("d1", "hi")
+        key = idempotency_key("add_memory", params)
         report = wal.replay(lambda op, p: None, dry_run=False, seen_keys={key})
         self.assertEqual(report["redone"], [])
         self.assertEqual(len(report["skipped_idempotent"]), 1)

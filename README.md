@@ -12,6 +12,15 @@
 | `openviking-delivery-receipt/` | volcengine/OpenViking | [#8232](https://github.com/volcengine/OpenViking/issues/8232)（统一投递结算契约） | per-delivery receipt 契约：dequeue 返回 (message_id, delivery_id)、ack/retry 条件结算、serial 槽仅在当前投递结算时释放；含 RFC 验收场景测试 |
 | `mempalace-wal-recovery/` | MemPalace/mempalace | [#3050](https://github.com/MemPalace/mempalace/issues/3050)（WAL 恢复契约） | wal_id 关联配对（无 ID 退回顺序配对）+ 意图条目 fsync + dry-run 默认的幂等回放 |
 
+## 红蓝对抗加固（2026-11-26）
+
+全部五个条目已通过一轮红蓝对抗验证：
+
+- **红队**：16 项攻击向量（原缺陷 PoC 复现 + 新增向量：毒行注入、双重应用、幂等键互撞、坏 JSONL、崩溃卡死、陈旧 ACK、时钟回拨），对原始副本命中 11 项。
+- **蓝队**：修复 4 项内核级缺陷并补修时钟回拨（RT-J5）后，16/16 全部防御成立。
+- **回归**：五套原有测试套件全绿，零回归。
+- 本仓库当前内容即加固后的修复版；上游缺陷在各自 main 分支仍在（行号证据见各提案议题的跟进评论）。
+
 ## 通用约定
 
 - 所有实现**自包含、仅标准库**（promptfoo 条目为标准 JavaScript），可直接独立运行。

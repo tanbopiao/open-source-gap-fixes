@@ -26,6 +26,7 @@ proposes running against all three upstream backends.
 from __future__ import annotations
 
 import itertools
+import time
 import uuid
 from typing import Optional
 
@@ -47,12 +48,13 @@ class SettlementResult:
 class ReceiptQueueBackend:
     """In-memory queue backend with per-delivery receipts."""
 
-    def __init__(self) -> None:
+    def __init__(self, clock=time.monotonic) -> None:
         self._pending: list[dict] = []  # ordered messages: {message_id, serial_key, payload}
         self._processing: dict[str, dict] = {}  # message_id -> {delivery_id, serial_key, payload}
         self._serial_slot: dict[str, str] = {}  # serial_key -> message_id holding the slot
         self._ids = itertools.count()
         self.acked: list[tuple[str, str]] = []  # audit: (message_id, delivery_id)
+        self._clock = clock  # injectable for tests; monotonic by default
 
     # -- delivery --------------------------------------------------------------
 
@@ -76,6 +78,7 @@ class ReceiptQueueBackend:
             "delivery_id": did,
             "serial_key": msg["serial_key"],
             "payload": msg["payload"],
+            "dequeued_at": self._clock(),
         }
         self._serial_slot[msg["serial_key"]] = msg["message_id"]
         return (msg["message_id"], did)
@@ -127,6 +130,34 @@ class ReceiptQueueBackend:
             del self._serial_slot[serial_key]
         self.enqueue(message_id, serial_key, entry["payload"])
         return SettlementResult(True, "requeued")
+
+    # -- crash recovery ----------------------------------------------------------
+
+    def reclaim_expired(self, visibility_timeout: float) -> list[str]:
+        """Return expired in-flight messages to the pending queue.
+
+        Red-team fix (2026-11-26 exercise): the original module had no
+        recovery path — a consumer crash left messages stuck in
+        ``_processing`` forever, so the documented crash/heartbeat
+        redelivery never actually happened. An expired delivery is re-queued
+        at the FRONT of the pending queue (preserving original serial order)
+        and will be redelivered with a fresh delivery_id on the next
+        dequeue. The serial slot stays held until the redelivery settles.
+        """
+        now = self._clock()
+        reclaimed: list[str] = []
+        for message_id in list(self._processing):
+            entry = self._processing[message_id]
+            if now - entry["dequeued_at"] < visibility_timeout:
+                continue
+            del self._processing[message_id]
+            self._pending.insert(0, {
+                "message_id": message_id,
+                "serial_key": entry["serial_key"],
+                "payload": entry["payload"],
+            })
+            reclaimed.append(message_id)
+        return reclaimed
 
     # -- introspection (conformance helpers) ------------------------------------
 

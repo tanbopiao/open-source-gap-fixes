@@ -111,6 +111,11 @@ def _region_covered(i1: int, i2: int, changed_spans) -> bool:
     if not changed_spans:
         return False
     length = i2 - i1
+    if length <= 0:
+        # Pure insertion (i1 == i2): there is no old-text region to cover, so
+        # a declared unchanged span can never cover it — it is a violation,
+        # not a crash. (Red-team fix: ZeroDivisionError on insert opcodes.)
+        return False
     overlap = sum(
         max(0, min(i2, end) - max(i1, start)) for start, end in changed_spans
     )
