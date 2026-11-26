@@ -1,0 +1,202 @@
+"""Span-level update contract for textual memory (reference implementation).
+
+Implements the untouched-span verification proposed in
+https://github.com/MemTensor/MemOS/issues/2656 (RFC) and motivated by #2527.
+
+The module is intentionally dependency-free (stdlib only) so it can be
+reviewed and tested in isolation.  It is a *reference* implementation of the
+``warn`` mode described in the RFC; wiring into the production feedback path
+is deliberately minimal (see the accompanying patch).
+
+Modes
+-----
+``off``      : no verification (current behaviour, default).
+``warn``     : undeclared changes are logged and allowed through.
+``enforce``  : undeclared changes raise :class:`SpanContractViolation`.
+
+The mode is read from the environment variable ``MEMOS_UPDATE_CONTRACT``
+(one of ``off`` / ``warn`` / ``enforce``), defaulting to ``off``.
+"""
+
+from __future__ import annotations
+
+import difflib
+import os
+import re
+from dataclasses import dataclass
+
+__all__ = [
+    "SpanContractViolation",
+    "SpanContractMode",
+    "normalize_ws",
+    "diff_blocks",
+    "verify_untouched_spans",
+    "apply_update_with_contract",
+    "current_mode",
+]
+
+
+class SpanContractViolation(Exception):
+    """Raised in ``enforce`` mode when an update touches undeclared spans."""
+
+    def __init__(self, violations):
+        self.violations = violations
+        names = ", ".join(v.tag for v in violations)
+        super().__init__(
+            f"untouched-span verification failed: {len(violations)} undeclared "
+            f"change block(s) [{names}]"
+        )
+
+
+@dataclass(frozen=True)
+class SpanContractMode:
+    OFF = "off"
+    WARN = "warn"
+    ENFORCE = "enforce"
+
+
+_VALID_MODES = {"off", "warn", "enforce"}
+
+
+def current_mode(env: dict | None = None) -> str:
+    """Read the contract mode from ``MEMOS_UPDATE_CONTRACT`` (default ``off``)."""
+    source = os.environ if env is None else env
+    mode = (source.get("MEMOS_UPDATE_CONTRACT") or "off").strip().lower()
+    return mode if mode in _VALID_MODES else "off"
+
+
+def normalize_ws(text: str) -> str:
+    """Collapse whitespace so formatting-only edits do not count as changes."""
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def diff_blocks(old_text: str, new_text: str):
+    """Return non-equal opcodes between the normalized texts.
+
+    Each block is ``(tag, i1, i2, j1, j2)`` where ``i1:i2`` indexes the
+    normalized *old* text and ``j1:j2`` the normalized *new* text.
+    """
+    sm = difflib.SequenceMatcher(
+        None, normalize_ws(old_text), normalize_ws(new_text), autojunk=False
+    )
+    return [op for op in sm.get_opcodes() if op[0] != "equal"]
+
+
+def _covered(block_start: int, block_end: int, changed_spans) -> bool:
+    return any(start <= block_start and block_end <= end for start, end in changed_spans)
+
+
+# Adjacent diff fragments closer than this are merged into one change region.
+_MERGE_GAP = 3
+
+# A change region counts as "declared" when at least this fraction of its
+# length lies inside a declared span (diff alignment can shift boundaries by
+# a few characters around shared sentence prefixes).
+_COVER_RATIO = 0.85
+
+
+def _change_regions(blocks):
+    """Merge fragmented diff opcodes into maximal contiguous change regions."""
+    regions = []
+    for tag, i1, i2, j1, j2 in blocks:
+        if regions and i1 - regions[-1][1] <= _MERGE_GAP:
+            p1, p2, q1, q2 = regions[-1]
+            regions[-1] = (p1, max(p2, i2), q1, max(q2, j2))
+        else:
+            regions.append((i1, i2, j1, j2))
+    return regions
+
+
+def _region_covered(i1: int, i2: int, changed_spans) -> bool:
+    if not changed_spans:
+        return False
+    length = i2 - i1
+    overlap = sum(
+        max(0, min(i2, end) - max(i1, start)) for start, end in changed_spans
+    )
+    return overlap / length >= _COVER_RATIO
+
+
+def verify_untouched_spans(old_text: str, new_text: str, changed_spans):
+    """Verify that every change between ``old_text`` and ``new_text`` is declared.
+
+    ``changed_spans`` is a list of ``(start, end)`` tuples indexing the
+    *normalized* old text; regions inside any declared span may change freely,
+    everything else must be identical after whitespace normalization.
+
+    Returns a list of :class:`SpanViolation` (empty when the update is clean).
+    """
+    normalized_old = normalize_ws(old_text)
+    normalized_new = normalize_ws(new_text)
+    violations = []
+    for i1, i2, j1, j2 in _change_regions(diff_blocks(old_text, new_text)):
+        if _region_covered(i1, i2, changed_spans):
+            continue
+        violations.append(
+            SpanViolation(
+                tag="change",
+                old_start=i1,
+                old_end=i2,
+                new_start=j1,
+                new_end=j2,
+                old_fragment=normalized_old[i1:i2],
+                new_fragment=normalized_new[j1:j2],
+            )
+        )
+    return violations
+
+
+@dataclass(frozen=True)
+class SpanViolation:
+    tag: str
+    old_start: int
+    old_end: int
+    new_start: int
+    new_end: int
+    old_fragment: str
+    new_fragment: str
+
+    def describe(self) -> str:
+        return (
+            f"{self.tag} [{self.old_start}:{self.old_end}] -> "
+            f"[{self.new_start}:{self.new_end}] "
+            f"old={self.old_fragment[:60]!r} new={self.new_fragment[:60]!r}"
+        )
+
+
+def apply_update_with_contract(
+    old_text: str,
+    new_text: str,
+    changed_spans,
+    mode: str | None = None,
+    logger=None,
+):
+    """Apply the span contract to a candidate update.
+
+    Returns ``new_text`` when the update is allowed (clean, or ``warn`` mode
+    with violations logged).  Raises :class:`SpanContractViolation` in
+    ``enforce`` mode.  ``off`` mode is a no-op passthrough.
+    """
+    resolved = mode or current_mode()
+    if resolved == SpanContractMode.OFF:
+        return new_text
+
+    violations = verify_untouched_spans(old_text, new_text, changed_spans)
+    if not violations:
+        return new_text
+
+    if resolved == SpanContractMode.ENFORCE:
+        raise SpanContractViolation(violations)
+
+    # warn mode: log and allow
+    for v in violations:
+        (logger or _default_logger()).warning(
+            "[span-contract] undeclared change: %s", v.describe()
+        )
+    return new_text
+
+
+def _default_logger():
+    import logging
+
+    return logging.getLogger("memos.span_contract")
